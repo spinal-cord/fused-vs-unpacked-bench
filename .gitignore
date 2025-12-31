@@ -17,4 +17,5 @@ Thumbs.db
 
 # Output files
 *.log
-*.txt
+#benchmark results are saved as .txt
+#*.txt
