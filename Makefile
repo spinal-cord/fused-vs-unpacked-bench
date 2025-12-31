@@ -1,4 +1,5 @@
 # Makefile for Fused vs Unpacked Ternary Benchmark
+# Copyright (C) 2024 HyperFold Technologies UK Ltd.
 # Multi-architecture support with SIMD optimizations
 
 # Default compiler (can be overridden)
