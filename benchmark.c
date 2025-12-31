@@ -18,7 +18,21 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-#include <immintrin.h>  // For SIMD intrinsics
+
+/* ============================================================================
+ * PLATFORM DETECTION FOR SIMD
+ * ============================================================================ */
+/* Disable SIMD intrinsics on non-x86 platforms or if NO_SIMD is defined */
+#if defined(__x86_64__) && !defined(NO_SIMD)
+    #define SIMD_X86_64_AVAILABLE 1
+#else
+    #define SIMD_X86_64_AVAILABLE 0
+#endif
+
+/* Only include immintrin.h if x86-64 SIMD is available */
+#if SIMD_X86_64_AVAILABLE
+    #include <immintrin.h>
+#endif
 
 // ============================================================================
 // CONFIGURATION
@@ -278,6 +292,7 @@ void matvec_2bit_fused_sparse(const sparse_csr_2bit_t *csr, const float *input,
 // ADVANCED: FUSED KERNEL WITH SIMD (OPTIONAL)
 // ============================================================================
 #ifdef USE_SIMD
+#if SIMD_X86_64_AVAILABLE
 void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
                             float *output, int rows, int cols) {
     int packed_cols = (cols + 3) / 4;
@@ -336,7 +351,15 @@ void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
         output[r] = sum;
     }
 }
-#endif
+#else
+/* Provide a stub or fallback function if SIMD is requested but not available */
+void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
+                            float *output, int rows, int cols) {
+    fprintf(stderr, "SIMD is not available on this architecture. Using fused scalar version.\n");
+    matvec_2bit_fused(matrix_packed, input, output, rows, cols);
+}
+#endif /* SIMD_X86_64_AVAILABLE */
+#endif /* USE_SIMD */
 
 // ============================================================================
 // BENCHMARK HARNESS
