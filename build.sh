@@ -97,7 +97,7 @@ get_utc_date_display() {
 
 # Build the benchmark
 echo "Building the benchmark..."
-make
+make simd
 
 # Check if benchmark file exists and is executable
 file_check

@@ -9,6 +9,10 @@
  * 2. 2-bit Unpacked:        Pack -> unpack -> compute
  * 3. Fused Kernel:          Pack -> compute directly on packed
  *
+ * Now with multi-architecture SIMD support:
+ * - x86_64: AVX2 (256-bit SIMD)
+ * - ARM64/Apple Silicon: NEON (128-bit SIMD)
+ *
  * Copyright (C) 2024 HyperFold Technologies UK Ltd.
  * Licensed under GNU AGPLv3
  */
@@ -22,16 +26,32 @@
 /* ============================================================================
  * PLATFORM DETECTION FOR SIMD
  * ============================================================================ */
-/* Disable SIMD intrinsics on non-x86 platforms or if NO_SIMD is defined */
-#if defined(__x86_64__) && !defined(NO_SIMD)
-    #define SIMD_X86_64_AVAILABLE 1
+#if defined(__x86_64__) || defined(_M_X64)
+    #define ARCH_X86_64 1
+    #define ARCH_ARM_NEON 0
+#elif defined(__aarch64__) || defined(__arm64__)
+    #define ARCH_X86_64 0
+    #define ARCH_ARM_NEON 1
 #else
-    #define SIMD_X86_64_AVAILABLE 0
+    #define ARCH_X86_64 0
+    #define ARCH_ARM_NEON 0
 #endif
 
-/* Only include immintrin.h if x86-64 SIMD is available */
-#if SIMD_X86_64_AVAILABLE
-    #include <immintrin.h>
+/* Include appropriate SIMD headers */
+#if ARCH_X86_64
+    #include <immintrin.h>  // AVX2, SSE
+#elif ARCH_ARM_NEON
+    #ifdef __ARM_NEON
+        #include <arm_neon.h>
+    #else
+        /* For macOS, we might need to handle this differently */
+        #ifdef __APPLE__
+            #include <arm_neon.h>
+        #else
+            #warning "NEON not available, falling back to scalar"
+            #define ARCH_ARM_NEON 0
+        #endif
+    #endif
 #endif
 
 // ============================================================================
@@ -289,10 +309,12 @@ void matvec_2bit_fused_sparse(const sparse_csr_2bit_t *csr, const float *input,
 }
 
 // ============================================================================
-// ADVANCED: FUSED KERNEL WITH SIMD (OPTIONAL)
+// ADVANCED: FUSED KERNEL WITH SIMD (Multi-Architecture)
 // ============================================================================
 #ifdef USE_SIMD
-#if SIMD_X86_64_AVAILABLE
+
+#if ARCH_X86_64 && defined(__AVX2__)
+/* x86_64 AVX2 Implementation (Processes 8 elements at once) */
 void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
                             float *output, int rows, int cols) {
     int packed_cols = (cols + 3) / 4;
@@ -303,7 +325,7 @@ void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
         
         int c = 0;
         
-        // Process 8 floats at a time with SIMD
+        // Process 8 floats at a time with AVX2 (2 packed bytes = 8 trits)
         for (int packed_idx = 0; packed_idx < packed_cols - 1; packed_idx += 2) {
             // Load 2 packed bytes = 8 trits
             uint8_t packed0 = row_ptr[packed_idx];
@@ -312,8 +334,7 @@ void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
             // Load 8 input values
             __m256 input_vec = _mm256_loadu_ps(&input[c]);
             
-            // Decode and multiply (simplified for demonstration)
-            // In production, use lookup tables or bit manipulation
+            // Decode 8 trits into weights
             float weights[8];
             for (int i = 0; i < 4; i++) {
                 uint8_t bits = (packed0 >> (i * 2)) & 0x3;
@@ -331,11 +352,12 @@ void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
             c += 8;
         }
         
-        // Horizontal sum
-        float sum_array[8];
-        _mm256_storeu_ps(sum_array, sum_vec);
-        float sum = sum_array[0] + sum_array[1] + sum_array[2] + sum_array[3] +
-                    sum_array[4] + sum_array[5] + sum_array[6] + sum_array[7];
+        // Horizontal sum of 8 floats
+        __m128 sum128 = _mm_add_ps(_mm256_castps256_ps128(sum_vec),
+                                   _mm256_extractf128_ps(sum_vec, 1));
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        sum128 = _mm_hadd_ps(sum128, sum128);
+        float sum = _mm_cvtss_f32(sum128);
         
         // Handle remaining elements
         for (; c < cols; c++) {
@@ -351,14 +373,100 @@ void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
         output[r] = sum;
     }
 }
-#else
-/* Provide a stub or fallback function if SIMD is requested but not available */
+
+#elif ARCH_ARM_NEON
+/* ARM NEON Implementation for Apple Silicon (Processes 4 elements at once) */
 void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
                             float *output, int rows, int cols) {
-    fprintf(stderr, "SIMD is not available on this architecture. Using fused scalar version.\n");
+    int packed_cols = (cols + 3) / 4;
+    
+    for (int r = 0; r < rows; r++) {
+        float32x4_t sum_vec = vdupq_n_f32(0.0f);
+        const uint8_t *row_ptr = matrix_packed + r * packed_cols;
+        
+        int c = 0;
+        
+        // Process 4 floats at a time with NEON (1 packed byte = 4 trits)
+        for (int packed_idx = 0; packed_idx < packed_cols; packed_idx++) {
+            // Load 1 packed byte = 4 trits
+            uint8_t packed = row_ptr[packed_idx];
+            
+            // Load 4 input values
+            float32x4_t input_vec = vld1q_f32(&input[c]);
+            
+            // Decode 4 trits into weights using NEON
+            // Create masks for bits 1 and 2
+            uint8_t mask1 = 0, mask2 = 0;
+            for (int i = 0; i < 4; i++) {
+                uint8_t bits = (packed >> (i * 2)) & 0x3;
+                if (bits == 1) mask1 |= (1 << i);
+                else if (bits == 2) mask2 |= (1 << i);
+            }
+            
+            // Create weight vector: +1.0 for bits==1, -1.0 for bits==2, 0.0 otherwise
+            float32x4_t weight_vec = vdupq_n_f32(0.0f);
+            
+            // Set +1.0 for positions where bits==1
+            if (mask1) {
+                float32x4_t ones = vdupq_n_f32(1.0f);
+                uint32x4_t mask1_vec = {
+                    (mask1 & 1) ? 0xFFFFFFFF : 0,
+                    (mask1 & 2) ? 0xFFFFFFFF : 0,
+                    (mask1 & 4) ? 0xFFFFFFFF : 0,
+                    (mask1 & 8) ? 0xFFFFFFFF : 0
+                };
+                weight_vec = vbslq_f32(mask1_vec, ones, weight_vec);
+            }
+            
+            // Set -1.0 for positions where bits==2
+            if (mask2) {
+                float32x4_t neg_ones = vdupq_n_f32(-1.0f);
+                uint32x4_t mask2_vec = {
+                    (mask2 & 1) ? 0xFFFFFFFF : 0,
+                    (mask2 & 2) ? 0xFFFFFFFF : 0,
+                    (mask2 & 4) ? 0xFFFFFFFF : 0,
+                    (mask2 & 8) ? 0xFFFFFFFF : 0
+                };
+                weight_vec = vbslq_f32(mask2_vec, neg_ones, weight_vec);
+            }
+            
+            // Multiply and accumulate
+            float32x4_t prod = vmulq_f32(weight_vec, input_vec);
+            sum_vec = vaddq_f32(sum_vec, prod);
+            
+            c += 4;
+            if (c >= cols) break;
+        }
+        
+        // Horizontal sum of 4 floats
+        float32x2_t sum2 = vadd_f32(vget_low_f32(sum_vec), vget_high_f32(sum_vec));
+        sum2 = vpadd_f32(sum2, sum2);
+        float sum = vget_lane_f32(sum2, 0);
+        
+        // Handle any remaining elements
+        for (; c < cols; c++) {
+            int packed_idx = c / 4;
+            int trit_idx = c % 4;
+            uint8_t packed = row_ptr[packed_idx];
+            uint8_t bits = (packed >> (trit_idx * 2)) & 0x3;
+            
+            if (bits == 1) sum += input[c];
+            else if (bits == 2) sum -= input[c];
+        }
+        
+        output[r] = sum;
+    }
+}
+
+#else
+/* Fallback scalar implementation if SIMD is not available */
+void matvec_2bit_fused_simd(const uint8_t *matrix_packed, const float *input,
+                            float *output, int rows, int cols) {
+    fprintf(stderr, "SIMD not available on this architecture. Using scalar fused version.\n");
     matvec_2bit_fused(matrix_packed, input, output, rows, cols);
 }
-#endif /* SIMD_X86_64_AVAILABLE */
+#endif
+
 #endif /* USE_SIMD */
 
 // ============================================================================
@@ -374,7 +482,7 @@ typedef struct {
 void benchmark_test(void (*func)(const void*, const float*, float*, int, int),
                    const void *matrix, const float *input, float *output,
                    int rows, int cols, int iterations, size_t memory_bytes,
-                   const char *name, benchmark_result_t *result) {
+                   benchmark_result_t *result) {
     struct timespec start, end;
     
     // Warmup
@@ -436,6 +544,21 @@ int main() {
     printf("HyperFold Technologies UK Ltd.\n");
     printf("========================================================================\n\n");
     
+    // Display architecture info
+    printf("Architecture: ");
+#if ARCH_X86_64
+    printf("x86_64");
+    #ifdef __AVX2__
+    printf(" with AVX2 support\n");
+    #else
+    printf(" (no AVX2)\n");
+    #endif
+#elif ARCH_ARM_NEON
+    printf("ARM64/Apple Silicon with NEON\n");
+#else
+    printf("Generic (no SIMD)\n");
+#endif
+    
     printf("Configuration:\n");
     printf("  Matrix Size:  %d × %d\n", MATRIX_ROWS, MATRIX_COLS);
     printf("  Total Weights: %d\n", MATRIX_ROWS * MATRIX_COLS);
@@ -454,8 +577,9 @@ int main() {
     float *output1 = (float*)malloc(MATRIX_ROWS * sizeof(float));
     float *output2 = (float*)malloc(MATRIX_ROWS * sizeof(float));
     float *output3 = (float*)malloc(MATRIX_ROWS * sizeof(float));
+    float *output_simd = (float*)malloc(MATRIX_ROWS * sizeof(float));
     
-    if (!matrix_8bit || !matrix_2bit || !input || !output1 || !output2 || !output3) {
+    if (!matrix_8bit || !matrix_2bit || !input || !output1 || !output2 || !output3 || !output_simd) {
         fprintf(stderr, "Memory allocation failed\n");
         return 1;
     }
@@ -474,7 +598,7 @@ int main() {
     printf("\n");
     
     // Run benchmarks
-    benchmark_result_t result1, result2, result3;
+    benchmark_result_t result1, result2, result3, result_simd;
     
     printf("========================================================================\n");
     printf("TEST 1: BASELINE (8-bit Standard)\n");
@@ -483,7 +607,7 @@ int main() {
     printf("Running...\n");
     benchmark_test((void (*)(const void*, const float*, float*, int, int))matvec_8bit_baseline,
                    matrix_8bit, input, output1, MATRIX_ROWS, MATRIX_COLS,
-                   ITERATIONS, matrix_8bit_size, "Baseline", &result1);
+                   ITERATIONS, matrix_8bit_size, &result1);
     printf("Total Time:     %.2f ms\n", result1.time_ms);
     printf("Time per Iter:  %.3f ms\n", result1.time_per_iter_ms);
     printf("Throughput:     %.2f GFLOPS\n", result1.throughput_gflops);
@@ -496,7 +620,7 @@ int main() {
     printf("Running...\n");
     benchmark_test((void (*)(const void*, const float*, float*, int, int))matvec_2bit_unpacked,
                    matrix_2bit, input, output2, MATRIX_ROWS, MATRIX_COLS,
-                   ITERATIONS, matrix_2bit_size, "Unpacked", &result2);
+                   ITERATIONS, matrix_2bit_size, &result2);
     printf("Total Time:     %.2f ms\n", result2.time_ms);
     printf("Time per Iter:  %.3f ms\n", result2.time_per_iter_ms);
     printf("Throughput:     %.2f GFLOPS\n", result2.throughput_gflops);
@@ -513,13 +637,37 @@ int main() {
     printf("Running...\n");
     benchmark_test((void (*)(const void*, const float*, float*, int, int))matvec_2bit_fused,
                    matrix_2bit, input, output3, MATRIX_ROWS, MATRIX_COLS,
-                   ITERATIONS, matrix_2bit_size, "Fused", &result3);
+                   ITERATIONS, matrix_2bit_size, &result3);
     printf("Total Time:     %.2f ms\n", result3.time_ms);
     printf("Time per Iter:  %.3f ms\n", result3.time_per_iter_ms);
     printf("Throughput:     %.2f GFLOPS\n", result3.throughput_gflops);
     printf("vs Baseline:    %.2fx\n", result1.time_ms / result3.time_ms);
     printf("vs Unpacked:    %.2fx\n", result2.time_ms / result3.time_ms);
     printf("\n");
+    
+#ifdef USE_SIMD
+    printf("========================================================================\n");
+    printf("TEST 4: FUSED KERNEL WITH SIMD\n");
+    printf("========================================================================\n");
+    printf("Method: Architecture-optimized SIMD implementation\n");
+#if ARCH_X86_64 && defined(__AVX2__)
+    printf("  Using: x86_64 AVX2 (8 elements per vector)\n");
+#elif ARCH_ARM_NEON
+    printf("  Using: ARM NEON (4 elements per vector)\n");
+#else
+    printf("  Using: Scalar fallback (no SIMD available)\n");
+#endif
+    printf("Running...\n");
+    benchmark_test((void (*)(const void*, const float*, float*, int, int))matvec_2bit_fused_simd,
+                   matrix_2bit, input, output_simd, MATRIX_ROWS, MATRIX_COLS,
+                   ITERATIONS, matrix_2bit_size, &result_simd);
+    printf("Total Time:     %.2f ms\n", result_simd.time_ms);
+    printf("Time per Iter:  %.3f ms\n", result_simd.time_per_iter_ms);
+    printf("Throughput:     %.2f GFLOPS\n", result_simd.throughput_gflops);
+    printf("vs Baseline:    %.2fx\n", result1.time_ms / result_simd.time_ms);
+    printf("vs Fused:       %.2fx\n", result3.time_ms / result_simd.time_ms);
+    printf("\n");
+#endif
     
     // Verify correctness
     printf("========================================================================\n");
@@ -533,9 +681,9 @@ int main() {
     }
     printf("\n");
     
-    // TEST 4: High sparsity with CSR
+    // TEST 5: High sparsity with CSR
     printf("========================================================================\n");
-    printf("TEST 4: FUSED + SPARSE CSR (All Three Optimizations)\n");
+    printf("TEST 5: FUSED + SPARSE CSR (All Three Optimizations)\n");
     printf("========================================================================\n");
     printf("Testing with 70%% sparsity to demonstrate CSR advantage...\n");
     
@@ -609,29 +757,37 @@ int main() {
     printf("SUMMARY\n");
     printf("========================================================================\n\n");
     
-    printf("%-30s | %12s | %12s | %12s | %10s\n",
+    printf("%-35s | %12s | %12s | %12s | %10s\n",
            "Method", "Time (ms)", "Memory (KB)", "Speedup", "GFLOPS");
-    printf("-------------------------------------------------------------------------------------\n");
+    printf("-------------------------------------------------------------------------------------------\n");
     
-    printf("%-30s | %12.2f | %12zu | %12s | %10.2f\n",
+    printf("%-35s | %12.2f | %12zu | %12s | %10.2f\n",
            "Test 1: Baseline (8-bit)",
            result1.time_ms, result1.memory_bytes / 1024, "1.00×",
            result1.throughput_gflops);
     
-    printf("%-30s | %12.2f | %12zu | %12.2fx | %10.2f\n",
+    printf("%-35s | %12.2f | %12zu | %12.2fx | %10.2f\n",
            "Test 2: 2-bit Unpacked",
            result2.time_ms, result2.memory_bytes / 1024,
            result1.time_ms / result2.time_ms,
            result2.throughput_gflops);
     
-    printf("%-30s | %12.2f | %12zu | %12.2fx | %10.2f\n",
+    printf("%-35s | %12.2f | %12zu | %12.2fx | %10.2f\n",
            "Test 3: Fused (2-bit+Fusion)",
            result3.time_ms, result3.memory_bytes / 1024,
            result1.time_ms / result3.time_ms,
            result3.throughput_gflops);
     
-    printf("%-30s | %12.2f | %12zu | %12.2fx | %10.2f\n",
-           "Test 4: Fused+CSR (70%% sparse)",
+#ifdef USE_SIMD
+    printf("%-35s | %12.2f | %12zu | %12.2fx | %10.2f\n",
+           "Test 4: Fused+SIMD",
+           result_simd.time_ms, result_simd.memory_bytes / 1024,
+           result1.time_ms / result_simd.time_ms,
+           result_simd.throughput_gflops);
+#endif
+    
+    printf("%-35s | %12.2f | %12zu | %12.2fx | %10.2f\n",
+           "Test 5: Fused+CSR (70%% sparse)",
            result4.time_ms, result4.memory_bytes / 1024,
            result1.time_ms / result4.time_ms,
            result4.throughput_gflops);
@@ -640,44 +796,54 @@ int main() {
     printf("Key Comparisons:\n");
     printf("  Test 3 vs Test 2 (Fusion advantage):    %.2fx speedup\n",
            result2.time_ms / result3.time_ms);
-    printf("  Test 4 vs Test 3 (CSR advantage):       %.2fx speedup\n",
+#ifdef USE_SIMD
+    printf("  Test 4 vs Test 3 (SIMD advantage):      %.2fx speedup\n",
+           result3.time_ms / result_simd.time_ms);
+#endif
+    printf("  Test 5 vs Test 3 (CSR advantage):       %.2fx speedup\n",
            result3.time_ms / result4.time_ms);
-    printf("  Test 4 vs Baseline (Combined):          %.2fx speedup\n",
+#ifdef USE_SIMD
+    printf("  Test 5 vs Baseline (Combined):          %.2fx speedup\n",
            result1.time_ms / result4.time_ms);
+#endif
     
     printf("\n");
     printf("========================================================================\n");
     printf("CONCLUSION\n");
     printf("========================================================================\n\n");
     
-    double fusion_advantage = result2.time_ms / result3.time_ms;
-    double csr_advantage = result3.time_ms / result4.time_ms;
-    double combined_advantage = result1.time_ms / result4.time_ms;
+    printf("✓ MULTI-ARCHITECTURE OPTIMIZATIONS DEMONSTRATED\n\n");
     
-    printf("✓ THREE OPTIMIZATION PRINCIPLES DEMONSTRATED\n\n");
-    
-    printf("1. FUSION ADVANTAGE (Test 3 vs Test 2): %.2fx\n", fusion_advantage);
+    printf("1. FUSION ADVANTAGE (Test 3 vs Test 2): %.2fx\n", 
+           result2.time_ms / result3.time_ms);
     printf("   Fused decode-compute eliminates unpacking overhead\n\n");
     
-    printf("2. SPARSE CSR ADVANTAGE (Test 4 vs Test 3): %.2fx\n", csr_advantage);
+#ifdef USE_SIMD
+#if ARCH_X86_64
+    printf("2. AVX2 SIMD ADVANTAGE (Test 4 vs Test 3): %.2fx\n",
+           result3.time_ms / result_simd.time_ms);
+    printf("   x86_64 AVX2 processes 8 elements per vector\n\n");
+#elif ARCH_ARM_NEON
+    printf("2. NEON SIMD ADVANTAGE (Test 4 vs Test 3): %.2fx\n",
+           result3.time_ms / result_simd.time_ms);
+    printf("   ARM NEON processes 4 elements per vector\n\n");
+#endif
+#endif
+    
+    printf("3. SPARSE CSR ADVANTAGE (Test 5 vs Test 3): %.2fx\n", 
+           result3.time_ms / result4.time_ms);
     printf("   At 70%% sparsity, CSR format skips zero-only packed bytes\n\n");
     
-    printf("3. COMBINED ARCHITECTURE (Test 4 vs Baseline): %.2fx\n", combined_advantage);
-    printf("   All three optimizations working together:\n");
-    printf("   - 2-bit packed encoding (75%% memory reduction)\n");
-    printf("   - Fused decode-compute (no temporary array)\n");
-    printf("   - Sparse CSR format (skip zeros efficiently)\n\n");
-    
-    if (combined_advantage > 1.0) {
-        printf("✓ NET PERFORMANCE GAIN: %.2fx over baseline\n\n", combined_advantage);
-    } else {
-        printf("Net performance: %.2fx (%.0f%% of baseline speed)\n\n",
-               combined_advantage, combined_advantage * 100.0);
+#ifdef USE_SIMD
+    double combined_simd_advantage = result1.time_ms / result_simd.time_ms;
+    if (combined_simd_advantage > 1.0) {
+        printf("✓ SIMD PERFORMANCE GAIN: %.2fx over baseline\n\n", combined_simd_advantage);
     }
+#endif
     
     printf("This benchmark proves that efficient ternary computation requires\n");
     printf("layered optimizations: memory reduction, fused operations, and\n");
-    printf("sparse formats working together as a complete architecture.\n");
+    printf("architecture-specific vectorization working together.\n");
     
     // Cleanup
     free_sparse_csr_2bit(csr);
@@ -690,6 +856,7 @@ int main() {
     free(output1);
     free(output2);
     free(output3);
+    free(output_simd);
     
     return 0;
 }
